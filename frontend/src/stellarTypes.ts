@@ -89,6 +89,7 @@ export type ChainVerifierState = {
 }
 
 export type ChainProofRecord = {
+  proofId?: string
   videoHash: string
   metadataHash: string
   tier: number
