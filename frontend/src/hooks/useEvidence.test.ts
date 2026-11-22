@@ -1,6 +1,7 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useEvidence } from './useEvidence'
+import { ApiClientError } from '../services/apiError'
 
 const { hashFileInWorkerMock, embedVideoMock } = vi.hoisted(() => ({
   hashFileInWorkerMock: vi.fn(),
@@ -230,6 +231,187 @@ describe('useEvidence hashing progress', () => {
     })
     expect(hashFileInWorkerMock).toHaveBeenCalledTimes(3)
     expect(result.current.proof?.sourceHash).toBe('e'.repeat(64))
+  })
+})
+
+describe('useEvidence upload admission and queue state', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('maps queue_full backend rejection to actionable admission state', async () => {
+    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
+    embedVideoMock.mockRejectedValue(
+      new ApiClientError({
+        code: 'QUEUE_FULL',
+        message: 'Upload queue is currently full. Wait 5 seconds and retry.',
+        detail: 'service overloaded',
+        requestId: null,
+        action: 'retry',
+        retryable: true,
+        status: 503,
+        reason: 'queue_full',
+        retryAfter: 5,
+      }),
+    )
+
+    const { result } = renderHook(() => useEvidence())
+    await act(async () => {
+      await result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
+    })
+
+    expect(result.current.stage).toBe('error')
+    expect(result.current.uploadErrorKind).toBe('admission_rejected')
+    expect(result.current.isRejectedUpload).toBe(true)
+    expect(result.current.isInvalidEvidence).toBe(false)
+    expect(result.current.admissionState).toEqual({
+      status: 'rejected',
+      reason: 'queue_full',
+      message: 'Upload queue is currently full. Wait 5 seconds and retry.',
+      retryAfter: 5,
+      retryable: true,
+      actionHint: 'retry',
+    })
+  })
+
+  it('maps identity_limit rejection to actionable admission state', async () => {
+    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
+    embedVideoMock.mockRejectedValue(
+      new ApiClientError({
+        code: 'IDENTITY_LIMIT',
+        message: 'Identity limit reached. Try again in 10s.',
+        detail: 'service overloaded',
+        requestId: null,
+        action: 'retry',
+        retryable: true,
+        status: 429,
+        reason: 'identity_limit',
+        retryAfter: 10,
+      }),
+    )
+
+    const { result } = renderHook(() => useEvidence())
+    await act(async () => {
+      await result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
+    })
+
+    expect(result.current.uploadErrorKind).toBe('admission_rejected')
+    expect(result.current.isRejectedUpload).toBe(true)
+    expect(result.current.admissionState?.reason).toBe('identity_limit')
+    expect(result.current.admissionState?.retryAfter).toBe(10)
+  })
+
+  it('maps timeout rejection to actionable admission state', async () => {
+    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
+    embedVideoMock.mockRejectedValue(
+      new ApiClientError({
+        code: 'TIMEOUT',
+        message: 'Request timed out waiting for admission slot.',
+        detail: 'service overloaded',
+        requestId: null,
+        action: 'retry',
+        retryable: true,
+        status: 503,
+        reason: 'timeout',
+        retryAfter: null,
+      }),
+    )
+
+    const { result } = renderHook(() => useEvidence())
+    await act(async () => {
+      await result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
+    })
+
+    expect(result.current.uploadErrorKind).toBe('admission_rejected')
+    expect(result.current.isRejectedUpload).toBe(true)
+    expect(result.current.admissionState?.reason).toBe('timeout')
+  })
+
+  it('distinguishes invalid evidence from admission rejection', async () => {
+    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
+    embedVideoMock.mockRejectedValue(
+      new ApiClientError({
+        code: 'VALIDATION_ERROR',
+        message: 'Video file corrupted or unsupported format.',
+        detail: 'Invalid container format',
+        requestId: null,
+        action: 'fix_input',
+        retryable: false,
+        status: 400,
+      }),
+    )
+
+    const { result } = renderHook(() => useEvidence())
+    await act(async () => {
+      await result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
+    })
+
+    expect(result.current.stage).toBe('error')
+    expect(result.current.uploadErrorKind).toBe('invalid_evidence')
+    expect(result.current.isRejectedUpload).toBe(false)
+    expect(result.current.isInvalidEvidence).toBe(true)
+    expect(result.current.admissionState).toBeNull()
+  })
+
+  it('retries upload with the active file when retryUpload is called', async () => {
+    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
+    embedVideoMock
+      .mockRejectedValueOnce(
+        new ApiClientError({
+          code: 'QUEUE_FULL',
+          message: 'Queue full.',
+          detail: 'service overloaded',
+          requestId: null,
+          action: 'retry',
+          retryable: true,
+          status: 503,
+          reason: 'queue_full',
+          retryAfter: 2,
+        }),
+      )
+      .mockResolvedValueOnce({
+        embeddedBlob: new Blob(['embedded']),
+        embeddedHash: 'b'.repeat(64),
+        metadataHash: 'c'.repeat(64),
+      })
+
+    const { result } = renderHook(() => useEvidence())
+    const testFile = new File(['bytes'], 'evidence.mp4')
+
+    await act(async () => {
+      await result.current.handleEvidence(testFile)
+    })
+
+    expect(result.current.isRejectedUpload).toBe(true)
+    expect(result.current.stage).toBe('error')
+
+    // Calling retryUpload triggers handleEvidence with testFile
+    await act(async () => {
+      await result.current.retryUpload()
+    })
+
+    expect(result.current.stage).toBe('ready')
+    expect(result.current.uploadErrorKind).toBe('none')
+    expect(result.current.isRejectedUpload).toBe(false)
+    expect(result.current.admissionState?.status).toBe('admitted')
+  })
+
+  it('resets admission state when cancelEvidence is called', async () => {
+    hashFileInWorkerMock.mockImplementation(() => new Promise(() => {}))
+
+    const { result } = renderHook(() => useEvidence())
+    act(() => {
+      void result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
+    })
+
+    act(() => {
+      result.current.cancelEvidence()
+    })
+
+    expect(result.current.stage).toBe('cancelled')
+    expect(result.current.admissionState).toBeNull()
+    expect(result.current.uploadErrorKind).toBe('none')
+    expect(result.current.isRejectedUpload).toBe(false)
   })
 })
 

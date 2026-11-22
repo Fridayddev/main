@@ -11,7 +11,14 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Building2, Fingerprint, KeyRound } from 'lucide-react'
-import type { IdentityTier, ProofPackage, SilentWitnessProof, Stage } from '../types'
+import type {
+  IdentityTier,
+  ProofPackage,
+  SilentWitnessProof,
+  Stage,
+  UploadAdmissionState,
+  UploadErrorKind,
+} from '../types'
 import type { RegisterProofResult } from '../stellarTypes'
 import type { HashProgress } from '../utils'
 import {
@@ -20,6 +27,12 @@ import {
 } from '../workers/proofWorkerClient'
 import { hashFileInWorker } from '../workers/fileHashWorkerClient'
 import { appConfig } from '../config'
+import {
+  ApiClientError,
+  isAdmissionError,
+  toAdmissionReason,
+  isInvalidEvidenceError,
+} from '../services/apiError'
 
 export const TIERS = [
   {
@@ -77,7 +90,12 @@ export type UseEvidenceReturn = {
   registration: RegisterProofResult | null
   networkMismatch: string | null
   isCancellable: boolean
+  admissionState: UploadAdmissionState | null
+  uploadErrorKind: UploadErrorKind
+  isRejectedUpload: boolean
+  isInvalidEvidence: boolean
   handleEvidence: (nextFile: File | null) => Promise<void>
+  retryUpload: () => Promise<void>
   registerProof: (wallet: string) => Promise<void>
   cancelEvidence: () => void
   /** Cancel an in-flight Silent Witness proof generation (no-op if idle). */
@@ -103,6 +121,8 @@ export function useEvidence(): UseEvidenceReturn {
   const [message, setMessage] = useState<string>('Upload evidence to begin.')
   const [registration, setRegistration] = useState<RegisterProofResult | null>(null)
   const [networkMismatch, setNetworkMismatch] = useState<string | null>(null)
+  const [admissionState, setAdmissionState] = useState<UploadAdmissionState | null>(null)
+  const [uploadErrorKind, setUploadErrorKind] = useState<UploadErrorKind>('none')
   // Keep retries safe: a completed proof/wallet pair must never be submitted twice.
   const registrationInFlightedRef = useRef<boolean>(false)
   const completedRegistrationRef = useRef<string | null>(null)
@@ -164,6 +184,8 @@ export function useEvidence(): UseEvidenceReturn {
     setProof(null)
     setFile(null)
     setRegistration(null)
+    setAdmissionState(null)
+    setUploadErrorKind('none')
   }
 
   function getProofClient(): ProofWorkerClient {
@@ -184,6 +206,9 @@ export function useEvidence(): UseEvidenceReturn {
 
   async function handleEvidence(nextFile: File | null) {
     if (!nextFile) return
+
+    setAdmissionState(null)
+    setUploadErrorKind('none')
 
     evidenceFlowAbortRef.current?.abort()
     const controller = new AbortController()
@@ -275,12 +300,44 @@ export function useEvidence(): UseEvidenceReturn {
         timestamp,
         tier: selectedTier,
       })
+      setAdmissionState({
+        status: 'admitted',
+        reason: null,
+        message: 'Upload admitted and processed successfully.',
+        retryAfter: null,
+        retryable: false,
+        actionHint: 'none',
+      })
+      setUploadErrorKind('none')
       setStage('ready')
       setMessage('Embedded evidence package is ready for Stellar registration.')
     } catch (error) {
       if (!isCurrentFlow()) return
       setStage('error')
-      setMessage(error instanceof Error ? error.message : 'Evidence processing failed.')
+      const errorMessage = error instanceof Error ? error.message : 'Evidence processing failed.'
+      setMessage(errorMessage)
+
+      if (isAdmissionError(error)) {
+        const admissionReason = toAdmissionReason(error)
+        const retryAfter = error instanceof ApiClientError ? error.retryAfter : null
+        const actionHint =
+          error instanceof ApiClientError ? (error.action as UploadAdmissionState['actionHint']) : 'retry'
+        setUploadErrorKind('admission_rejected')
+        setAdmissionState({
+          status: 'rejected',
+          reason: admissionReason,
+          message: errorMessage,
+          retryAfter,
+          retryable: true,
+          actionHint: actionHint ?? 'retry',
+        })
+      } else if (isInvalidEvidenceError(error)) {
+        setUploadErrorKind('invalid_evidence')
+        setAdmissionState(null)
+      } else {
+        setUploadErrorKind('unknown')
+        setAdmissionState(null)
+      }
     } finally {
       if (evidenceFlowAbortRef.current === controller) {
         evidenceFlowAbortRef.current = null
@@ -428,7 +485,7 @@ export function useEvidence(): UseEvidenceReturn {
       return { ...baseProof, silentWitness }
     } catch (error) {
       if (error instanceof ProofWorkerError && error.code === 'CANCELLED') {
-        throw new Error('Proof generation cancelled.')
+        throw new Error('Proof generation cancelled.', { cause: error })
       }
       throw error
     } finally {
@@ -457,6 +514,16 @@ export function useEvidence(): UseEvidenceReturn {
     setMessage(CANCELLED_MESSAGES[currentStage])
   }
 
+  async function retryUpload() {
+    if (file) {
+      await handleEvidence(file)
+    }
+  }
+
+  const isRejectedUpload =
+    uploadErrorKind === 'admission_rejected' && admissionState?.status === 'rejected'
+  const isInvalidEvidence = uploadErrorKind === 'invalid_evidence'
+
   return {
     selectedTier,
     setSelectedTier,
@@ -474,7 +541,12 @@ export function useEvidence(): UseEvidenceReturn {
     registration,
     networkMismatch,
     isCancellable,
+    admissionState,
+    uploadErrorKind,
+    isRejectedUpload,
+    isInvalidEvidence,
     handleEvidence,
+    retryUpload,
     registerProof,
     cancelEvidence,
     cancelProving,
